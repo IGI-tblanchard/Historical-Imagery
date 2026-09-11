@@ -11,8 +11,8 @@ input_roots = [
     r"P:\IGG\Z_Drive\Whitecap\Imagery\Historicals",
 ]
 
-target_gdb = r"P:\IGG\Z_Drive\Historical_Imagery_Boundary.gdb"
-target_feature_class_name = "Historical_Boundary_1"
+target_gdb = r"P:\IGG\Z_Drive\Staging\Historical_Imagery_Staging.gdb"
+target_feature_class_name = "Historical_Boundary"
 client_field_name = "Client"
 path_field_name = "Path"
 prefixroll_field_name = "PrefixRoll"
@@ -98,6 +98,19 @@ def iter_tiff_files(root_dir):
                 yield os.path.join(dirpath, filename)
 
 
+def get_existing_paths(feature_class, path_field):
+    """Read all existing paths from the feature class to avoid duplicates."""
+    existing_paths = set()
+    try:
+        with arcpy.da.SearchCursor(feature_class, [path_field]) as s_cur:
+            for row in s_cur:
+                if row[0]:
+                    existing_paths.add(row[0].lower())
+    except Exception as ex:
+        print(f"[WARNING] Error reading existing paths from feature class: {ex}")
+    return existing_paths
+
+
 if __name__ == "__main__":
     arcpy.env.overwriteOutput = True
 
@@ -130,12 +143,18 @@ if __name__ == "__main__":
     print(f"Target feature class: {target_fc}")
     print(f"Target CRS: {target_sr.name}")
 
+    # Load existing paths from the feature class
+    print("Loading existing paths from feature class...")
+    existing_paths = get_existing_paths(target_fc, path_field_name)
+    print(f"Found {len(existing_paths)} existing paths in feature class")
+
     scanned_tiffs = 0
     missing_roots = 0
     duplicate_scan_filenames = 0
     inserted = 0
     skipped_unknown_client = 0
     skipped_invalid = 0
+    skipped_existing = 0
 
     discovered_by_path = {}
 
@@ -149,6 +168,11 @@ if __name__ == "__main__":
         for tif_path in iter_tiff_files(root):
             scanned_tiffs += 1
             path_key = tif_path.lower()
+
+            # Skip if already in feature class
+            if path_key in existing_paths:
+                skipped_existing += 1
+                continue
 
             if path_key in discovered_by_path:
                 duplicate_scan_filenames += 1
@@ -167,6 +191,8 @@ if __name__ == "__main__":
         year_field_name,
         date_field_name,
     ]
+
+    print(f"Processing {len(discovered_by_path)} new files...")
 
     with arcpy.da.InsertCursor(target_fc, insert_fields) as i_cur:
         for path_key, (file_name, tif_path, source_root) in discovered_by_path.items():
@@ -281,7 +307,9 @@ if __name__ == "__main__":
     print(f"Roots configured: {len(input_roots)}")
     print(f"Missing roots: {missing_roots}")
     print(f"TIFF files scanned: {scanned_tiffs}")
+    print(f"Existing paths skipped: {skipped_existing}")
     print(f"Duplicate filenames found during scan: {duplicate_scan_filenames}")
+    print(f"New files discovered: {len(discovered_by_path)}")
     print(f"Features inserted: {inserted}")
     print(f"Skipped unknown client in path: {skipped_unknown_client}")
     print(f"Skipped invalid/error: {skipped_invalid}")

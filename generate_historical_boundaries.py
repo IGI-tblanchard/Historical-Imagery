@@ -169,6 +169,8 @@ if __name__ == "__main__":
 
     discovered_by_path = {}
     staging_insert_rows = []
+    csv_rows = []
+    csv_rows_by_path = {}
 
     for root in input_roots:
         if not os.path.isdir(root):
@@ -192,8 +194,6 @@ if __name__ == "__main__":
 
             discovered_by_path[path_key] = (os.path.basename(tif_path), tif_path, root)
 
-    csv_rows = []
-
     insert_fields = [
         "SHAPE@",
         client_field_name,
@@ -213,22 +213,13 @@ if __name__ == "__main__":
 
             if not client_value:
                 skipped_unknown_client += 1
-                csv_rows.append([file_name, tif_path, "", "", "", "", source_root, "SKIP_UNKNOWN_CLIENT"])
+                csv_rows.append([file_name, tif_path, "SKIP_UNKNOWN_CLIENT", "NOT_ATTEMPTED"])
                 print(f"[SKIP][UNKNOWN CLIENT] {tif_path}")
                 continue
 
             if not os.path.isfile(tif_path):
                 skipped_invalid += 1
-                csv_rows.append([
-                    file_name,
-                    tif_path,
-                    client_value,
-                    parsed_name["prefixroll"],
-                    parsed_name["photo"],
-                    parsed_name["date_text"],
-                    source_root,
-                    "SKIP_INVALID_PATH",
-                ])
+                csv_rows.append([file_name, tif_path, "SKIP_INVALID_PATH", "NOT_ATTEMPTED"])
                 print(f"[SKIP][INVALID TIFF] {tif_path}")
                 continue
 
@@ -239,31 +230,13 @@ if __name__ == "__main__":
 
                 if extent is None:
                     skipped_invalid += 1
-                    csv_rows.append([
-                        file_name,
-                        tif_path,
-                        client_value,
-                        parsed_name["prefixroll"],
-                        parsed_name["photo"],
-                        parsed_name["date_text"],
-                        source_root,
-                        "SKIP_NO_EXTENT",
-                    ])
+                    csv_rows.append([file_name, tif_path, "SKIP_NO_EXTENT", "NOT_ATTEMPTED"])
                     print(f"[SKIP][NO EXTENT] {tif_path}")
                     continue
 
                 if src_sr is None or src_sr.name.lower() == "unknown":
                     skipped_invalid += 1
-                    csv_rows.append([
-                        file_name,
-                        tif_path,
-                        client_value,
-                        parsed_name["prefixroll"],
-                        parsed_name["photo"],
-                        parsed_name["date_text"],
-                        source_root,
-                        "SKIP_UNKNOWN_CRS",
-                    ])
+                    csv_rows.append([file_name, tif_path, "SKIP_UNKNOWN_CRS", "NOT_ATTEMPTED"])
                     print(f"[SKIP][UNKNOWN CRS] {tif_path}")
                     continue
 
@@ -300,29 +273,12 @@ if __name__ == "__main__":
                         ],
                     }
                 )
-                csv_rows.append([
-                    file_name,
-                    tif_path,
-                    client_value,
-                    parsed_name["prefixroll"],
-                    parsed_name["photo"],
-                    parsed_name["date_text"],
-                    source_root,
-                    "INSERTED",
-                ])
+                csv_rows.append([file_name, tif_path, "INSERTED", "PENDING"])
+                csv_rows_by_path[path_key] = len(csv_rows) - 1
 
             except Exception as ex:
                 skipped_invalid += 1
-                csv_rows.append([
-                    file_name,
-                    tif_path,
-                    client_value,
-                    parsed_name["prefixroll"],
-                    parsed_name["photo"],
-                    parsed_name["date_text"],
-                    source_root,
-                    "SKIP_ERROR",
-                ])
+                csv_rows.append([file_name, tif_path, "SKIP_ERROR", "NOT_ATTEMPTED"])
                 print(f"[SKIP][ERROR] {tif_path}: {ex}")
 
     production_fc = os.path.join(production_gdb, target_feature_class_name)
@@ -331,17 +287,28 @@ if __name__ == "__main__":
 
         if not arcpy.Exists(production_gdb):
             production_skipped_error += len(staging_insert_rows)
+            for inserted_row in staging_insert_rows:
+                idx = csv_rows_by_path.get(inserted_row["path_key"])
+                if idx is not None:
+                    csv_rows[idx][3] = "NOT_ATTEMPTED"
             print(f"[WARNING] Production geodatabase not found. Skipping sync: {production_gdb}")
         elif not arcpy.Exists(production_fc):
             production_skipped_error += len(staging_insert_rows)
+            for inserted_row in staging_insert_rows:
+                idx = csv_rows_by_path.get(inserted_row["path_key"])
+                if idx is not None:
+                    csv_rows[idx][3] = "NOT_ATTEMPTED"
             print(f"[WARNING] Production feature class not found. Skipping sync: {production_fc}")
         else:
             try:
                 production_existing_paths = get_existing_paths(production_fc, path_field_name)
                 rows_to_insert_production = []
                 for inserted_row in staging_insert_rows:
+                    idx = csv_rows_by_path.get(inserted_row["path_key"])
                     if inserted_row["path_key"] in production_existing_paths:
                         production_skipped_existing += 1
+                        if idx is not None:
+                            csv_rows[idx][3] = "SKIP_EXISTING"
                     else:
                         rows_to_insert_production.append(inserted_row)
 
@@ -349,34 +316,57 @@ if __name__ == "__main__":
                     try:
                         with arcpy.da.InsertCursor(production_fc, insert_fields) as p_cur:
                             for inserted_row in rows_to_insert_production:
+                                idx = csv_rows_by_path.get(inserted_row["path_key"])
                                 try:
                                     p_cur.insertRow(inserted_row["row_values"])
                                     production_inserted += 1
+                                    if idx is not None:
+                                        csv_rows[idx][3] = "INSERTED"
                                 except Exception as ex:
                                     if is_lock_error(ex):
                                         production_skipped_locked += 1
+                                        if idx is not None:
+                                            csv_rows[idx][3] = "SKIP_LOCK"
                                         print(f"[SKIP][PRODUCTION LOCK] {inserted_row['path_value']}: {ex}")
                                     else:
                                         production_skipped_error += 1
+                                        if idx is not None:
+                                            csv_rows[idx][3] = "SKIP_ERROR"
                                         print(f"[SKIP][PRODUCTION ERROR] {inserted_row['path_value']}: {ex}")
                     except Exception as ex:
                         if is_lock_error(ex):
                             production_skipped_locked += len(rows_to_insert_production)
+                            for inserted_row in rows_to_insert_production:
+                                idx = csv_rows_by_path.get(inserted_row["path_key"])
+                                if idx is not None:
+                                    csv_rows[idx][3] = "SKIP_LOCK"
                             print(f"[WARNING] Production insert skipped due to lock: {ex}")
                         else:
                             production_skipped_error += len(rows_to_insert_production)
+                            for inserted_row in rows_to_insert_production:
+                                idx = csv_rows_by_path.get(inserted_row["path_key"])
+                                if idx is not None:
+                                    csv_rows[idx][3] = "SKIP_ERROR"
                             print(f"[WARNING] Production insert skipped due to error: {ex}")
             except Exception as ex:
                 if is_lock_error(ex):
                     production_skipped_locked += len(staging_insert_rows)
+                    for inserted_row in staging_insert_rows:
+                        idx = csv_rows_by_path.get(inserted_row["path_key"])
+                        if idx is not None:
+                            csv_rows[idx][3] = "SKIP_LOCK"
                     print(f"[WARNING] Production sync skipped due to lock while reading existing paths: {ex}")
                 else:
                     production_skipped_error += len(staging_insert_rows)
+                    for inserted_row in staging_insert_rows:
+                        idx = csv_rows_by_path.get(inserted_row["path_key"])
+                        if idx is not None:
+                            csv_rows[idx][3] = "SKIP_ERROR"
                     print(f"[WARNING] Production sync skipped due to error while reading existing paths: {ex}")
 
     with open(new_files_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["filename", "tiff_path", "client", "prefixroll", "photo", "date", "source_root", "status"])
+        writer.writerow(["filename", "tiff_path", "staging_status", "final_status"])
         writer.writerows(csv_rows)
 
     print("\nDone")

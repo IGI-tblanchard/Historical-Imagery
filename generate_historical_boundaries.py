@@ -12,6 +12,7 @@ input_roots = [
 ]
 
 target_gdb = r"P:\IGG\Z_Drive\Staging\Historical_Imagery_Staging.gdb"
+production_gdb = r"P:\IGG\Z_Drive\Historical_Imagery_Boundary.gdb"
 target_feature_class_name = "Historical_Boundary"
 client_field_name = "Client"
 path_field_name = "Path"
@@ -98,7 +99,7 @@ def iter_tiff_files(root_dir):
                 yield os.path.join(dirpath, filename)
 
 
-def get_existing_paths(feature_class, path_field):
+def get_existing_paths(feature_class, path_field, raise_on_error=False):
     """Read all existing paths from the feature class to avoid duplicates."""
     existing_paths = set()
     try:
@@ -107,8 +108,16 @@ def get_existing_paths(feature_class, path_field):
                 if row[0]:
                     existing_paths.add(row[0].lower())
     except Exception as ex:
+        if raise_on_error:
+            raise
         print(f"[WARNING] Error reading existing paths from feature class: {ex}")
     return existing_paths
+
+
+def is_lock_error(ex):
+    """Best-effort detection for lock-related ArcPy errors."""
+    error_text = str(ex).lower()
+    return "lock" in error_text
 
 
 if __name__ == "__main__":
@@ -155,8 +164,13 @@ if __name__ == "__main__":
     skipped_unknown_client = 0
     skipped_invalid = 0
     skipped_existing = 0
+    production_inserted = 0
+    production_skipped_existing = 0
+    production_skipped_locked = 0
+    production_skipped_error = 0
 
     discovered_by_path = {}
+    staging_insert_rows = []
 
     for root in input_roots:
         if not os.path.isdir(root):
@@ -273,6 +287,21 @@ if __name__ == "__main__":
                     ]
                 )
                 inserted += 1
+                staging_insert_rows.append(
+                    {
+                        "path_key": path_key,
+                        "path_value": tif_path,
+                        "row_values": [
+                            poly,
+                            client_value,
+                            tif_path,
+                            parsed_name["prefixroll"],
+                            parsed_name["photo"],
+                            insert_year,
+                            insert_date,
+                        ],
+                    }
+                )
                 csv_rows.append([
                     file_name,
                     tif_path,
@@ -298,6 +327,55 @@ if __name__ == "__main__":
                 ])
                 print(f"[SKIP][ERROR] {tif_path}: {ex}")
 
+    production_fc = os.path.join(production_gdb, target_feature_class_name)
+    if staging_insert_rows:
+        print(f"Syncing {len(staging_insert_rows)} new staging rows to production: {production_fc}")
+
+        if not arcpy.Exists(production_gdb):
+            production_skipped_error += len(staging_insert_rows)
+            print(f"[WARNING] Production geodatabase not found. Skipping sync: {production_gdb}")
+        elif not arcpy.Exists(production_fc):
+            production_skipped_error += len(staging_insert_rows)
+            print(f"[WARNING] Production feature class not found. Skipping sync: {production_fc}")
+        else:
+            try:
+                production_existing_paths = get_existing_paths(production_fc, path_field_name, raise_on_error=True)
+                rows_to_insert_production = []
+                for inserted_row in staging_insert_rows:
+                    if inserted_row["path_key"] in production_existing_paths:
+                        production_skipped_existing += 1
+                    else:
+                        rows_to_insert_production.append(inserted_row)
+
+                if rows_to_insert_production:
+                    try:
+                        with arcpy.da.InsertCursor(production_fc, insert_fields) as p_cur:
+                            for inserted_row in rows_to_insert_production:
+                                try:
+                                    p_cur.insertRow(inserted_row["row_values"])
+                                    production_inserted += 1
+                                except Exception as ex:
+                                    if is_lock_error(ex):
+                                        production_skipped_locked += 1
+                                        print(f"[SKIP][PRODUCTION LOCK] {inserted_row['path_value']}: {ex}")
+                                    else:
+                                        production_skipped_error += 1
+                                        print(f"[SKIP][PRODUCTION ERROR] {inserted_row['path_value']}: {ex}")
+                    except Exception as ex:
+                        if is_lock_error(ex):
+                            production_skipped_locked += len(rows_to_insert_production)
+                            print(f"[WARNING] Production insert skipped due to lock: {ex}")
+                        else:
+                            production_skipped_error += len(rows_to_insert_production)
+                            print(f"[WARNING] Production insert skipped due to error: {ex}")
+            except Exception as ex:
+                if is_lock_error(ex):
+                    production_skipped_locked += len(staging_insert_rows)
+                    print(f"[WARNING] Production sync skipped due to lock while reading existing paths: {ex}")
+                else:
+                    production_skipped_error += len(staging_insert_rows)
+                    print(f"[WARNING] Production sync skipped due to error while reading existing paths: {ex}")
+
     with open(new_files_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["filename", "tiff_path", "client", "prefixroll", "photo", "date", "source_root", "status"])
@@ -313,4 +391,8 @@ if __name__ == "__main__":
     print(f"Features inserted: {inserted}")
     print(f"Skipped unknown client in path: {skipped_unknown_client}")
     print(f"Skipped invalid/error: {skipped_invalid}")
+    print(f"Production features inserted: {production_inserted}")
+    print(f"Production existing paths skipped: {production_skipped_existing}")
+    print(f"Production rows skipped due to lock: {production_skipped_locked}")
+    print(f"Production rows skipped due to errors: {production_skipped_error}")
     print(f"CSV output: {new_files_csv}")

@@ -22,6 +22,7 @@ year_field_name = "Year"
 date_field_name = "Date"
 new_files_csv = r"C:\Users\tblanchard\Documents\Tracy\Code\Historical Imagery\5.1_new_historical_photos.csv"
 valid_extensions = {".tif", ".tiff"}
+required_raster_crs_code = 26911
 
 
 def parse_tiff_name(file_path):
@@ -31,6 +32,7 @@ def parse_tiff_name(file_path):
     year = None
     date_value = None
     date_text = ""
+    invalid_date = False
 
     paren_match = re.search(r"\((\d{4})(?:-(\d{2})-(\d{2}))?\)\s*$", stem)
     if paren_match:
@@ -43,7 +45,7 @@ def parse_tiff_name(file_path):
                 date_value = datetime.datetime(int(year), int(month_str), int(day_str))
                 date_text = f"{year}-{month_str}-{day_str}"
             except ValueError:
-                pass
+                invalid_date = True
     else:
         base = stem
 
@@ -61,7 +63,19 @@ def parse_tiff_name(file_path):
         "year": year,
         "date": date_value,
         "date_text": date_text,
+        "invalid_date": invalid_date,
     }
+
+
+def validate_tiff_name(parsed_name):
+    """Require at least a non-empty PrefixRoll and trailing four-digit year."""
+    if not parsed_name["prefixroll"]:
+        return "missing PrefixRoll"
+    if parsed_name["year"] is None:
+        return "missing trailing year in parentheses; expected at least Prefix(yyyy)"
+    if parsed_name["invalid_date"]:
+        return "invalid calendar date in (yyyy-mm-dd) suffix"
+    return None
 
 
 def derive_client_from_path(file_path):
@@ -106,10 +120,28 @@ def get_existing_paths(feature_class, path_field):
         with arcpy.da.SearchCursor(feature_class, [path_field]) as s_cur:
             for row in s_cur:
                 if row[0]:
-                    existing_paths.add(row[0].lower())
+                    existing_paths.add(normalize_path(row[0]))
     except Exception as ex:
         print(f"[WARNING] Error reading existing paths from feature class: {ex}")
     return existing_paths
+
+
+def get_existing_rows_by_path(feature_class, fields, path_index):
+    """Read feature rows keyed by their normalized path value."""
+    rows_by_path = {}
+    try:
+        with arcpy.da.SearchCursor(feature_class, fields) as s_cur:
+            for row in s_cur:
+                if row[path_index]:
+                    rows_by_path[normalize_path(row[path_index])] = list(row)
+    except Exception as ex:
+        print(f"[WARNING] Error reading existing rows from feature class: {ex}")
+    return rows_by_path
+
+
+def normalize_path(file_path):
+    """Normalize path spelling for comparisons across feature classes and scans."""
+    return os.path.normcase(os.path.normpath(str(file_path).replace("/", "\\")))
 
 
 def is_lock_error(ex):
@@ -127,6 +159,12 @@ if __name__ == "__main__":
     target_fc = os.path.join(target_gdb, target_feature_class_name)
     if not arcpy.Exists(target_fc):
         raise RuntimeError(f"Target feature class not found: {target_fc}")
+
+    production_fc = os.path.join(production_gdb, target_feature_class_name)
+    if not arcpy.Exists(production_gdb):
+        raise RuntimeError(f"Production geodatabase not found: {production_gdb}")
+    if not arcpy.Exists(production_fc):
+        raise RuntimeError(f"Production feature class not found: {production_fc}")
 
     field_names = [f.name.lower() for f in arcpy.ListFields(target_fc)]
     required_fields = [
@@ -150,10 +188,22 @@ if __name__ == "__main__":
     print(f"Target feature class: {target_fc}")
     print(f"Target CRS: {target_sr.name}")
 
-    # Load existing paths from the feature class
-    print("Loading existing paths from feature class...")
-    existing_paths = get_existing_paths(target_fc, path_field_name)
-    print(f"Found {len(existing_paths)} existing paths in feature class")
+    # Production is authoritative for deciding whether a TIFF is already complete.
+    print("Loading existing paths from production feature class...")
+    existing_paths = get_existing_paths(production_fc, path_field_name)
+    staging_row_fields = [
+        "SHAPE@",
+        client_field_name,
+        path_field_name,
+        prefixroll_field_name,
+        photo_field_name,
+        year_field_name,
+        date_field_name,
+    ]
+    staging_rows_by_path = get_existing_rows_by_path(target_fc, staging_row_fields, 2)
+    staging_paths = set(staging_rows_by_path)
+    print(f"Found {len(existing_paths)} existing production paths")
+    print(f"Found {len(staging_paths)} existing staging paths")
 
     scanned_tiffs = 0
     missing_roots = 0
@@ -161,6 +211,8 @@ if __name__ == "__main__":
     inserted = 0
     skipped_unknown_client = 0
     skipped_invalid = 0
+    skipped_invalid_name = 0
+    skipped_wrong_crs = 0
     skipped_existing = 0
     production_inserted = 0
     production_skipped_existing = 0
@@ -181,7 +233,7 @@ if __name__ == "__main__":
         print(f"Scanning: {root}")
         for tif_path in iter_tiff_files(root):
             scanned_tiffs += 1
-            path_key = tif_path.lower()
+            path_key = normalize_path(tif_path)
 
             # Skip if already in feature class
             if path_key in existing_paths:
@@ -223,6 +275,14 @@ if __name__ == "__main__":
                 print(f"[SKIP][INVALID TIFF] {tif_path}")
                 continue
 
+            name_error = validate_tiff_name(parsed_name)
+            if name_error:
+                skipped_invalid += 1
+                skipped_invalid_name += 1
+                csv_rows.append([file_name, tif_path, "SKIP_INVALID_NAME", "NOT_ATTEMPTED"])
+                print(f"[SKIP][INVALID NAME] {tif_path}: {name_error}")
+                continue
+
             try:
                 desc = arcpy.Describe(tif_path)
                 extent = desc.extent
@@ -238,6 +298,29 @@ if __name__ == "__main__":
                     skipped_invalid += 1
                     csv_rows.append([file_name, tif_path, "SKIP_UNKNOWN_CRS", "NOT_ATTEMPTED"])
                     print(f"[SKIP][UNKNOWN CRS] {tif_path}")
+                    continue
+
+                if src_sr.factoryCode != required_raster_crs_code:
+                    skipped_invalid += 1
+                    skipped_wrong_crs += 1
+                    csv_rows.append([file_name, tif_path, "SKIP_WRONG_CRS", "NOT_ATTEMPTED"])
+                    print(
+                        f"[SKIP][WRONG CRS] {tif_path}: expected EPSG:{required_raster_crs_code} "
+                        f"(NAD83 / UTM zone 11N), found {src_sr.name} "
+                        f"(factory code {src_sr.factoryCode})."
+                    )
+                    continue
+
+                if path_key in staging_rows_by_path:
+                    staging_insert_rows.append(
+                        {
+                            "path_key": path_key,
+                            "path_value": tif_path,
+                            "row_values": staging_rows_by_path[path_key],
+                        }
+                    )
+                    csv_rows.append([file_name, tif_path, "STAGING_EXISTING", "PENDING"])
+                    csv_rows_by_path[path_key] = len(csv_rows) - 1
                     continue
 
                 poly = make_extent_polygon(extent, src_sr)
@@ -281,26 +364,10 @@ if __name__ == "__main__":
                 csv_rows.append([file_name, tif_path, "SKIP_ERROR", "NOT_ATTEMPTED"])
                 print(f"[SKIP][ERROR] {tif_path}: {ex}")
 
-    production_fc = os.path.join(production_gdb, target_feature_class_name)
     if staging_insert_rows:
         print(f"Syncing {len(staging_insert_rows)} new staging rows to production: {production_fc}")
 
-        if not arcpy.Exists(production_gdb):
-            production_skipped_error += len(staging_insert_rows)
-            for inserted_row in staging_insert_rows:
-                idx = csv_rows_by_path.get(inserted_row["path_key"])
-                if idx is not None:
-                    csv_rows[idx][3] = "NOT_ATTEMPTED"
-            print(f"[WARNING] Production geodatabase not found. Skipping sync: {production_gdb}")
-        elif not arcpy.Exists(production_fc):
-            production_skipped_error += len(staging_insert_rows)
-            for inserted_row in staging_insert_rows:
-                idx = csv_rows_by_path.get(inserted_row["path_key"])
-                if idx is not None:
-                    csv_rows[idx][3] = "NOT_ATTEMPTED"
-            print(f"[WARNING] Production feature class not found. Skipping sync: {production_fc}")
-        else:
-            try:
+        try:
                 production_existing_paths = get_existing_paths(production_fc, path_field_name)
                 rows_to_insert_production = []
                 for inserted_row in staging_insert_rows:
@@ -348,21 +415,21 @@ if __name__ == "__main__":
                                 if idx is not None:
                                     csv_rows[idx][3] = "SKIP_ERROR"
                             print(f"[WARNING] Production insert skipped due to error: {ex}")
-            except Exception as ex:
-                if is_lock_error(ex):
-                    production_skipped_locked += len(staging_insert_rows)
-                    for inserted_row in staging_insert_rows:
-                        idx = csv_rows_by_path.get(inserted_row["path_key"])
-                        if idx is not None:
-                            csv_rows[idx][3] = "SKIP_LOCK"
-                    print(f"[WARNING] Production sync skipped due to lock while reading existing paths: {ex}")
-                else:
-                    production_skipped_error += len(staging_insert_rows)
-                    for inserted_row in staging_insert_rows:
-                        idx = csv_rows_by_path.get(inserted_row["path_key"])
-                        if idx is not None:
-                            csv_rows[idx][3] = "SKIP_ERROR"
-                    print(f"[WARNING] Production sync skipped due to error while reading existing paths: {ex}")
+        except Exception as ex:
+            if is_lock_error(ex):
+                production_skipped_locked += len(staging_insert_rows)
+                for inserted_row in staging_insert_rows:
+                    idx = csv_rows_by_path.get(inserted_row["path_key"])
+                    if idx is not None:
+                        csv_rows[idx][3] = "SKIP_LOCK"
+                print(f"[WARNING] Production sync skipped due to lock while reading existing paths: {ex}")
+            else:
+                production_skipped_error += len(staging_insert_rows)
+                for inserted_row in staging_insert_rows:
+                    idx = csv_rows_by_path.get(inserted_row["path_key"])
+                    if idx is not None:
+                        csv_rows[idx][3] = "SKIP_ERROR"
+                print(f"[WARNING] Production sync skipped due to error while reading existing paths: {ex}")
 
     with open(new_files_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -378,6 +445,8 @@ if __name__ == "__main__":
     print(f"New files discovered: {len(discovered_by_path)}")
     print(f"Features inserted: {inserted}")
     print(f"Skipped unknown client in path: {skipped_unknown_client}")
+    print(f"Skipped invalid filename: {skipped_invalid_name}")
+    print(f"Skipped wrong CRS (expected EPSG:{required_raster_crs_code}): {skipped_wrong_crs}")
     print(f"Skipped invalid/error: {skipped_invalid}")
     print(f"Production features inserted: {production_inserted}")
     print(f"Production existing paths skipped: {production_skipped_existing}")

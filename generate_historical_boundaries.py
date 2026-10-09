@@ -36,13 +36,13 @@ sys.excepthook = _uncaught_exception
 
 # ---- configuration ----
 input_roots = [
-    r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Cenovus\Imagery\Historicals",
-    r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Tourmaline\Imagery\Historicals",
-    r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Whitecap\Imagery\Historicals",
+    r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Client\Cenovus\Imagery\Historicals",
+    r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Client\Tourmaline\Imagery\Historicals",
+    r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Client\Whitecap\Imagery\Historicals",
 ]
 
 target_gdb = r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Staging\Historical_Imagery_Staging.gdb"
-production_gdb = r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Historical_Imagery_Boundary.gdb"
+production_gdb = r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Geodatabase\Historical_Imagery_Boundary.gdb"
 target_feature_class_name = "Historical_Boundary"
 client_field_name = "Client"
 path_field_name = "Path"

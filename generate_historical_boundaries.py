@@ -35,17 +35,15 @@ def _uncaught_exception(exc_type, exc_value, exc_traceback):
 sys.excepthook = _uncaught_exception
 
 # ---- configuration ----
-input_roots = [
-    r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Client\Cenovus\Imagery\Historicals",
-    r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Client\Tourmaline\Imagery\Historicals",
-    r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Client\Whitecap\Imagery\Historicals",
-]
+client_root = r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Client"
+ignored_client_folders = {"_foldertemplate_client"}
 
 target_gdb = r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Staging\Historical_Imagery_Staging.gdb"
 production_gdb = r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Geodatabase\Historical_Imagery_Boundary.gdb"
 target_feature_class_name = "Historical_Boundary"
 client_field_name = "Client"
 path_field_name = "Path"
+folderpath_field_name = "FolderPath"
 prefixroll_field_name = "PrefixRoll"
 photo_field_name = "Photo"
 year_field_name = "Year"
@@ -177,6 +175,44 @@ def iter_tiff_files(root_dir):
                 yield os.path.join(dirpath, filename)
 
 
+def discover_input_roots():
+    """Find each client's existing Imagery/Historicals folder under Client."""
+    try:
+        client_folders = sorted(os.scandir(client_root), key=lambda entry: entry.name.casefold())
+    except OSError as ex:
+        run_report.exception("discover_client_folders", ex, input_path=client_root)
+        raise
+
+    input_roots = []
+    skipped_clients = []
+    missing_historical_folders = 0
+    for client_folder in client_folders:
+        if not client_folder.is_dir():
+            continue
+        if client_folder.name.casefold() in ignored_client_folders:
+            run_report.record("discover_client_folder", "skipped", client=client_folder.name,
+                              input_path=client_folder.path, message="Template client folder ignored")
+            continue
+
+        historical_root = os.path.join(client_folder.path, "Imagery", "Historicals")
+        if os.path.isdir(historical_root):
+            input_roots.append(historical_root)
+            run_report.record("discover_client_folder", "info", client=client_folder.name,
+                              input_path=historical_root,
+                              message="Historical imagery folder found; queued for recursive scan")
+        else:
+            missing_historical_folders += 1
+            skipped_clients.append(client_folder.name)
+            run_report.record("discover_client_folder", "skipped", client=client_folder.name,
+                              input_path=historical_root,
+                              message="No Imagery/Historicals folder; normal for this client")
+
+    print(f"Discovered {len(input_roots)} client historical imagery folder(s)")
+    if skipped_clients:
+        print(f"Clients without Imagery/Historicals: {', '.join(skipped_clients)}")
+    return input_roots, missing_historical_folders
+
+
 def get_existing_paths(feature_class, path_field):
     """Read all existing paths from the feature class to avoid duplicates."""
     existing_paths = set()
@@ -189,6 +225,37 @@ def get_existing_paths(feature_class, path_field):
         run_report.exception("read_existing_paths", ex, input_path=feature_class)
         raise
     return existing_paths
+
+
+def populate_folder_paths(feature_class):
+    """Populate FolderPath with the immediate parent of each stored Path."""
+    updated = 0
+    try:
+        with arcpy.da.UpdateCursor(
+            feature_class, [path_field_name, folderpath_field_name]
+        ) as cursor:
+            for row in cursor:
+                source_path = row[0]
+                if not source_path:
+                    continue
+                parent_folder = os.path.dirname(str(source_path))
+                if row[1] != parent_folder:
+                    row[1] = parent_folder
+                    cursor.updateRow(row)
+                    updated += 1
+    except Exception as ex:
+        run_report.exception(
+            "populate_folder_path", ex, output_path=feature_class,
+            details=arcpy.GetMessages(2),
+        )
+        raise
+
+    run_report.record(
+        "populate_folder_path", "completed", output_path=feature_class,
+        message=f"Populated FolderPath for {updated} existing feature(s)",
+    )
+    print(f"FolderPath updated on {updated} existing feature(s): {feature_class}")
+    return updated
 
 
 def get_existing_rows_by_path(feature_class, fields, path_index):
@@ -219,8 +286,15 @@ def is_lock_error(ex):
 if __name__ == "__main__":
     started_at = time.perf_counter()
     run_report.record("run", "started", message="Historical boundary generation started",
-                      details=(f"input_roots={input_roots}; staging_gdb={target_gdb}; "
+                      details=(f"client_root={client_root}; staging_gdb={target_gdb}; "
                                f"production_gdb={production_gdb}"))
+
+    input_roots, missing_roots = discover_input_roots()
+    if not input_roots:
+        message = f"No client Imagery/Historicals folders found under {client_root}"
+        run_report.record("discover_client_folders", "failed", input_path=client_root,
+                          message=message)
+        raise RuntimeError(message)
 
     try:
         arcpy.env.overwriteOutput = True
@@ -248,6 +322,7 @@ if __name__ == "__main__":
     required_fields = [
         client_field_name,
         path_field_name,
+        folderpath_field_name,
         prefixroll_field_name,
         photo_field_name,
         year_field_name,
@@ -265,6 +340,11 @@ if __name__ == "__main__":
                       message="Staging and production feature classes contain all required fields")
     run_report.record("validate_schema", "info", output_path=f"{target_fc}; {production_fc}",
                       message="Write availability will be determined by the actual feature insert operations")
+
+    # Populate the new field for all existing rows, including rows whose TIFF
+    # paths are already present and will therefore be skipped during scanning.
+    populate_folder_paths(target_fc)
+    populate_folder_paths(production_fc)
 
     target_sr = arcpy.Describe(target_fc).spatialReference
     year_field = [f for f in arcpy.ListFields(target_fc) if f.name.lower() == year_field_name.lower()][0]
@@ -284,6 +364,7 @@ if __name__ == "__main__":
         "SHAPE@",
         client_field_name,
         path_field_name,
+        folderpath_field_name,
         prefixroll_field_name,
         photo_field_name,
         year_field_name,
@@ -298,7 +379,6 @@ if __name__ == "__main__":
                       details=f"Staging feature class: {target_fc}")
 
     scanned_tiffs = 0
-    missing_roots = 0
     duplicate_scan_filenames = 0
     inserted = 0
     skipped_unknown_client = 0
@@ -363,6 +443,7 @@ if __name__ == "__main__":
         "SHAPE@",
         client_field_name,
         path_field_name,
+        folderpath_field_name,
         prefixroll_field_name,
         photo_field_name,
         year_field_name,
@@ -490,6 +571,7 @@ if __name__ == "__main__":
                         poly,
                         client_value,
                         tif_path,
+                        os.path.dirname(tif_path),
                         parsed_name["prefixroll"],
                         parsed_name["photo"],
                         insert_year,
@@ -505,6 +587,7 @@ if __name__ == "__main__":
                             poly,
                             client_value,
                             tif_path,
+                            os.path.dirname(tif_path),
                             parsed_name["prefixroll"],
                             parsed_name["photo"],
                             insert_year,
@@ -659,7 +742,7 @@ if __name__ == "__main__":
                       message=f"Wrote {len(csv_rows)} per-file result row(s)")
 
     print("\nDone")
-    print(f"Roots configured: {len(input_roots)}")
+    print(f"Client historical roots discovered: {len(input_roots)}")
     print(f"Missing roots: {missing_roots}")
     print(f"TIFF files scanned: {scanned_tiffs}")
     print(f"Existing paths skipped: {skipped_existing}")
